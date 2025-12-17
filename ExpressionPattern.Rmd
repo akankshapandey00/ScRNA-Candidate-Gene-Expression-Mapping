@@ -1,0 +1,326 @@
+---
+title: "4.f"
+author: "Akanksha Pandey"
+date: "2025-11-19"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(Seurat)
+library(patchwork)
+library(dplyr)
+library(data.table)
+library(Matrix)
+```
+
+```{r warning=FALSE}
+candidate_genes <- c("C1orf174", "LOC124903857", "TMEM161B", "ZNF808","C16orf54", "CNFN", "C8orf88", "PQLC2L")
+```
+
+# Loading 10x_v2_RNA_matrix.mtx
+
+I start by reading the header because .mtx is very large. This will tell me the no. of gene, no. of cells
+
+```{r warning=FALSE}
+
+# Reading first few lines
+mtx_info <- scan("10x_v2_RNA_matrix.mtx", what="", nlines=10, sep="\n")
+cat(mtx_info, sep="\n")
+
+```
+
+### Random sampling
+
+The dataset has 625000 cells which will be very large to process on a RAM limit so I will perform random sampling.
+
+```{r warning=FALSE}
+
+set.seed(123)   
+cells_to_keep <- sample(625677, 5000) 
+length(cells_to_keep)
+
+```
+
+### Creating an empty file
+
+As the original matrix is very large, I will create an empty file in this file I will write only the rows that correspond to my 5000 sampled cells
+
+```{r warning=FALSE}
+filtered_file <- "10x_v2_RNA_matrix_filtered.mtx"
+
+# Create or overwrite the file
+file.create(filtered_file)
+```
+
+Because the original 10x Genomics matrix is very large, it cannot be loaded into R in a single step. So, I streamed the .mtx file in chunks of 1 million lines at a time. For each chunk, I converted the coordinate triples (gene index i, cell index j, UMI count x) into a temporary data table and kept only the rows where the cell index belonged to my sampled set of 5,000 cells.These filtered rows were then appended to a new, much smaller file (10x_v2_RNA_matrix_filtered.mtx).
+
+```{r warning=FALSE}
+
+# Opening original .mtx file
+con <- file("10x_v2_RNA_matrix.mtx", "r")
+
+# Reading the first 3 header lines
+header1 <- readLines(con, n = 1)
+header2 <- readLines(con, n = 1)
+dims_line <- readLines(con, n = 1)
+
+# Writing the same header to the new filtered file
+writeLines(c(header1, header2, dims_line), filtered_file)
+
+# Setting how many lines to read at once 
+chunk_size <- 1000000
+
+repeat {
+    # Reading the next chunk from the .mtx file
+    chunk <- readLines(con, n = chunk_size)
+    
+    # Stopping if no more lines are left
+    if (length(chunk) == 0) break
+    
+    # Converting chunk to table (i j x)
+    dt_chunk <- fread(
+        text = chunk,
+        sep = " ",
+        col.names = c("i", "j", "x"),
+        header = FALSE
+    )
+    
+    # Filtering rows where j (cell index) is one of the selected 5000 cells
+    dt_filt <- dt_chunk[j %in% cells_to_keep]
+    
+    # Append filtered rows to our filtered .mtx file
+    write.table(
+        dt_filt,
+        file = filtered_file,
+        append = TRUE,
+        quote = FALSE,
+        sep = " ",
+        row.names = FALSE,
+        col.names = FALSE
+    )
+}
+
+# Close the file connection
+close(con)
+
+```
+
+### Loading 10x_v2_RNA_matrix_filtered.mtx
+
+```{r warning=FALSE}
+dt_sub <- fread("10x_v2_RNA_matrix_filtered.mtx",skip = 3, col.names = c("i", "j", "x"))
+
+# Checking how many rows were kept
+#dim(dt_sub)
+
+# Maping original cell indices to 1:5000
+mapped_cells <- match(dt_sub$j, cells_to_keep)
+
+# Building sparse matrix
+blood_sparse <- sparseMatrix(i = dt_sub$i,j = mapped_cells,x = dt_sub$x,dims= c(23269,length(cells_to_keep)))
+
+gc()
+
+```
+
+### Assign gene names + cell barcodes and Creat Seurat obj
+
+Because 10x Genomics format stores count matrix in 3 files I loaded the gene names and cell barcodes and assign them as the row and column names of the matrix. After that I converted the matrix into a Seurat object. To remove low-quality droplets and background noise I removed cells that have less than 200 detected genes and genes detected in less than 3 cells.
+
+```{r warning=FALSE}
+
+# Loading gene names, barcodes taking 1st col as vector
+features <- fread("10x_v2_RNA_features.tsv", header = FALSE)[[1]]
+barcodes <- fread("10x_v2_barcodes.tsv", header = FALSE)[[1]]
+
+# Subset barcodes to keep only those corresponding to sampled cells
+barcodes_sub <- barcodes[cells_to_keep]
+
+# Assigning row/column names to the sparse matrix
+rownames(blood_sparse) <- features
+colnames(blood_sparse) <- barcodes_sub
+
+# Creating Seurat object
+blood <- CreateSeuratObject(
+  counts = blood_sparse,
+  project = "Blood_5k",
+  min.cells = 3, 
+  min.features = 200)
+
+# Clean up memory
+rm(blood_sparse)
+gc()
+
+```
+
+# Loading GSE112013 dataset
+
+```{r}
+testis_dt <- fread("GSE112013_Combined_UMI_table.txt", header = TRUE)
+
+# Check dimensions
+dim(testis_dt)
+```
+
+### Converting
+
+As the 1st col is gene symbol i will extract it as row names then I will convert the table into num matrix to create a seurat obj
+
+```{r warning=FALSE}
+
+# 1st col contains gene names
+gene_names <- testis_dt[[1]]
+
+# Removing the 1st col to keep num counts
+testis_counts <- as.matrix(testis_dt[, -1, with = FALSE])
+
+# Assigning gene names
+rownames(testis_counts) <- gene_names
+
+# Check for numeric type
+mode(testis_counts) <- "numeric"
+
+```
+
+### Creating Seurat obj
+
+```{r warning=FALSE}
+testis <- CreateSeuratObject(counts = testis_counts,project ="Testis",min.cells=3,min.features = 200)
+testis
+```
+
+# Preprocessing and Dimensionality Reduction
+
+### Normalizing both datasets
+
+Normalizing will amke gene expression comparable acorss cells and datasets
+
+```{r warning=FALSE}
+blood <- NormalizeData(blood)
+testis <- NormalizeData(testis)
+```
+
+### FindVariableFeatures
+
+Identify highly variable genes
+
+```{r warning=FALSE}
+blood <- FindVariableFeatures(blood)
+testis <- FindVariableFeatures(testis)
+```
+
+### Scale data
+
+This will centers each gene at zero and standardizes variance, improving PCA performance
+
+```{r warning=FALSE}
+blood <- ScaleData(blood, features = rownames(blood))
+testis <- ScaleData(testis, features = rownames(testis))
+```
+
+### Principal Component Analysis (PCA)
+
+```{r warning=FALSE}
+blood <- RunPCA(blood, features = VariableFeatures(blood))
+testis <- RunPCA(testis, features = VariableFeatures(testis))
+
+```
+
+### Running UMAP
+
+This will allow visualization of clusters and expression patterns
+
+```{r warning=FALSE}
+blood <- RunUMAP(blood, dims = 1:30)
+testis <- RunUMAP(testis, dims = 1:30)
+
+```
+
+# Checking which of my candidate genes are present in each dataset
+
+This will tell me if candidate_genes are present in the dataset that I choose
+
+```{r warning=FALSE}
+candidate_genes[candidate_genes %in% rownames(blood)]
+candidate_genes[candidate_genes %in% rownames(testis)]
+
+```
+
+# Ploting expression of candidate genes
+
+### Expression in blood dataset
+
+```{r warning=FALSE}
+FeaturePlot(blood,features= candidate_genes[candidate_genes %in% rownames(blood)],reduction ="umap",ncol= 3)
+
+```
+
+Across blood dataset my candidate genes show very low expression
+
+###Expression in testis dataset
+
+```{r warning=FALSE}
+FeaturePlot(testis,features= candidate_genes[candidate_genes %in% rownames(testis)],reduction ="umap",ncol= 3)
+
+```
+
+In the testis dataset some genes show strong expression patterns
+
+# Integrate blood + testis scRNA-seq datasets
+
+Because my data is very large and is exceeding my RAM limit, I restricted scaling and PCA to the 2000 shared highly variable genes (HVGs). I then identified integration anchors using 20 PCs and constructed an integrated expression matrix. I ran PCA and UMAP on the integrated assay to visualize both datasets.
+
+```{r warning=FALSE}
+# Normalizing + find HVGs
+blood  <- NormalizeData(blood)
+blood  <- FindVariableFeatures(blood, nfeatures= 2000)
+
+testis <- NormalizeData(testis)
+testis <- FindVariableFeatures(testis, nfeatures= 2000)
+
+# Selecting shared HVGs
+integration_features <- SelectIntegrationFeatures(object.list=list(blood, testis),nfeatures=2000)
+
+# Scaling only HVGs 
+blood  <- ScaleData(blood,features= integration_features)
+testis <- ScaleData(testis,features= integration_features)
+
+# Running PCA only on HVGs
+blood  <- RunPCA(blood,features= integration_features)
+testis <- RunPCA(testis,features= integration_features)
+
+# Finding anchors
+anchors <- FindIntegrationAnchors(object.list= list(blood,testis),anchor.features =integration_features, dims = 1:20)
+
+# Integrating data
+combined <- IntegrateData(anchorset = anchors,dims = 1:20)
+
+# Downstreaming
+DefaultAssay(combined) <- "integrated"
+combined <- ScaleData(combined)
+combined <- RunPCA(combined)
+combined <- RunUMAP(combined, dims = 1:20)
+
+
+```
+
+### Ploting my candidate genes on the integrated UMAP
+
+```{r warning=FALSE}
+# switch to RNA for plotting real expression
+DefaultAssay(combined) <- "RNA"
+
+FeaturePlot(
+  combined,
+  features = candidate_genes,
+  cols = c("lightgrey", "blue"),
+  reduction = "umap",
+  ncol = 3
+)
+
+
+```
+
+When I plotted the seven candidate genes (C1orf174, TMEM161B, ZNF808, C16orf54, CNFN, C8orf88, and PQLC2L) on the integrated UMAP, all of these genes are expressed at low levels, and only in small pockets of cells.
